@@ -17,6 +17,14 @@
 //          that already have a token. A cohort rate, not a launch date:
 //          it rises with age because time accumulates, and it says nothing
 //          about when — or whether — a given protocol will launch.
+//   farm   Cost (gas + time at a stated $/hour) vs value at stake
+//          (odds x implied). The verdict is decided ONLY by the
+//          break-even share — the % of the value at stake one farmer must
+//          receive to cover costs: FARM at <= 0.001%, MARGINAL at
+//          <= 0.005%, SKIP above. No farmer share is ever invented.
+//   range  An 80% interval per row from leave-one-out residuals of the
+//          fitted curve, calibrated on held-out live comps (see
+//          intervalCalibration) and shown with its rank range.
 //   kept   Every other candidate term (category-median adjustment, 7-day
 //          growth, age, chain count) was tested by ablation against the
 //          curve alone on four held-out splits. A term is kept only if it
@@ -65,7 +73,10 @@ export interface Snapshot {
 export interface ModelConstants {
   comp_min_n: number;
   farm_hourly_rate_usd: number;
-  farm_assumed_share: number;
+  /** Break-even share at or below which a farm verdict is FARM: the farm breaks even if the farmer receives this % of the odds-weighted implied value. */
+  farm_verdict_farm_max_be_share_pct: number;
+  /** Break-even share at or below which a farm verdict is MARGINAL (above this: SKIP). */
+  farm_verdict_marginal_max_be_share_pct: number;
   interval_coverage: number;
   unknown_age_days: number;
 }
@@ -73,13 +84,14 @@ export interface ModelConstants {
 export const MODEL: ModelConstants = {
   comp_min_n: 4,
   farm_hourly_rate_usd: 20,
-  farm_assumed_share: 0.00005,
+  farm_verdict_farm_max_be_share_pct: 0.001,
+  farm_verdict_marginal_max_be_share_pct: 0.005,
   interval_coverage: 0.8,
   unknown_age_days: 365,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3-fitted-curve';
+export const MODEL_VERSION = 'radar-3.1-break-even-verdicts';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -128,13 +140,16 @@ export interface CohortBucket {
   rate: number;
 }
 
-/** A row's farm economics, from stated assumptions only. */
+/** A row's farm economics, from stated assumptions only. No farmer share is
+ *  invented anywhere: the verdict is decided by the break-even share — the
+ *  % of the odds-weighted implied value the airdrop must pay one farmer for
+ *  the farm to cover its cost. `value_at_stake_usd` is the odds-weighted
+ *  implied value itself, the pool the break-even share is taken from. */
 export interface FarmEconomics {
   gas_usd: number;
   time_hours: number;
   total_cost_usd: number;
-  expected_value_usd: number;
-  net_per_hour_usd: number;
+  value_at_stake_usd: number;
   break_even_share_pct: number;
   verdict: 'FARM' | 'MARGINAL' | 'SKIP';
 }
@@ -162,6 +177,9 @@ export interface BoardRow {
     odds_source: string;
     interval_low_usd: number;
     interval_high_usd: number;
+    /** Rank this row would hold if its value landed at the low / high end of its 80% interval. */
+    rank_range_low: number;
+    rank_range_high: number;
     farm: FarmEconomics;
     age_days: number | null;
   };
@@ -187,6 +205,8 @@ export interface RadarRow {
   odds_source: string;
   interval_low_usd: number;
   interval_high_usd: number;
+  rank_range_low: number;
+  rank_range_high: number;
   farm: FarmEconomics;
   on_watchlist: boolean;
   farm_steps: string[];
@@ -236,6 +256,7 @@ export interface RadarData {
   interval_low_factor: number;
   interval_high_factor: number;
   interval_loo_coverage: number;
+  interval_calibration: IntervalCalibration[];
   fallback_rows: number;
   categories_with_enough_comps: number;
   categories_total: number;
@@ -537,6 +558,58 @@ export function looResiduals(comps: SnapshotProtocol[], asOf: string): number[] 
   return res.sort((a, b) => a - b);
 }
 
+/** One held-out interval-calibration test: the 80% interval is calibrated
+ *  from the TRAIN comps' leave-one-out residuals only, then coverage is
+ *  measured on the TEST comps the calibration never saw. */
+export interface IntervalCalibration {
+  name: string;
+  n_test: number;
+  n_inside: number;
+  coverage: number;
+}
+
+/** Held-out interval calibration: for each split, calibrate the 80%
+ *  interval from train-only leave-one-out residuals and count how many
+ *  held-out live comps' actual market caps fall inside it. */
+export function intervalCalibration(comps: SnapshotProtocol[], asOf: string): IntervalCalibration[] {
+  const sorted = [...comps].sort((a, b) => (a.slug < b.slug ? -1 : 1));
+  const splits: { name: string; train: SnapshotProtocol[]; test: SnapshotProtocol[] }[] = [];
+  for (const seed of [1, 42]) {
+    const sh = shuffled(sorted, seed);
+    const half = Math.floor(sh.length / 2);
+    splits.push({ name: `Random 50/50 (seed ${seed})`, train: sh.slice(0, half), test: sh.slice(half) });
+  }
+  const byListed = [...comps].sort((a, b) => {
+    const la = a.listed_at ?? '9999-12-31';
+    const lb = b.listed_at ?? '9999-12-31';
+    return la < lb ? -1 : la > lb ? 1 : a.slug < b.slug ? -1 : 1;
+  });
+  const half = Math.floor(byListed.length / 2);
+  splits.push({ name: 'Walk-forward (older listed → newer listed)', train: byListed.slice(0, half), test: byListed.slice(half) });
+
+  return splits.map((s) => {
+    // Train-only LOO residuals: each train row predicted by a curve fitted
+    // on the other train rows.
+    const res: number[] = [];
+    for (let i = 0; i < s.train.length; i++) {
+      const train = s.train.filter((_, j) => j !== i);
+      const p = s.train[i]!;
+      res.push(Math.log(p.mcap_usd!) - makePredictor(train, asOf, 'curve')(p));
+    }
+    res.sort((a, b) => a - b);
+    const lo = res[Math.floor(0.1 * res.length)]!;
+    const hi = res[Math.floor(0.9 * res.length)]!;
+    const predict = makePredictor(s.train, asOf, 'curve');
+    let inside = 0;
+    for (const p of s.test) {
+      const pred = predict(p);
+      const actual = Math.log(p.mcap_usd!);
+      if (actual >= pred + lo && actual <= pred + hi) inside++;
+    }
+    return { name: s.name, n_test: s.test.length, n_inside: inside, coverage: round4(inside / Math.max(1, s.test.length)) };
+  });
+}
+
 /** Age buckets for the cohort rate. */
 export const AGE_BUCKETS: { label: string; lo: number; hi: number | null }[] = [
   { label: '<180 days', lo: 0, hi: 180 },
@@ -681,12 +754,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
  * A protocol's farm economics. Gas: $4 ($8 for large positions) to set up
  * plus $2 a week over the hold. Time: 35 minutes fixed plus 20 minutes a
  * week (one qualifying action + one rewards check), valued at the stated
- * hourly rate. Expected value: odds x implied value x the ASSUMED
- * single-farmer share of supply (0.005% — an assumption, stated on the
- * dashboard, not a measured fact). Break-even share is assumption-free:
- * the share of the implied value one farmer must receive to cover costs.
- * Verdict: FARM when expected value is at least 5x cost, MARGINAL when it
- * covers cost, SKIP when it does not.
+ * hourly rate. Value at stake: odds x implied value — the pool the airdrop
+ * would pay from. Break-even share is assumption-free: the share of that
+ * value one farmer must receive to cover costs.
+ * Verdict is decided ONLY by the break-even share, against the two stated
+ * cutoffs — no farmer share is invented: FARM when the farm breaks even
+ * even if the farmer receives at most 0.001% of the value at stake,
+ * MARGINAL up to 0.005%, SKIP above that. The cutoffs are decision
+ * thresholds written on the dashboard, not measured facts.
  */
 export function farmEconomics(p: SnapshotProtocol, age: number | null, impliedRaw: number, odds: number): FarmEconomics {
   const hold = holdDaysFor(age);
@@ -695,11 +770,19 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, impliedRa
   const gas = (capital >= 150 ? 8 : 4) + 2 * weeks;
   const timeHours = round4((35 + 20 * weeks) / 60);
   const totalCost = round4(gas + timeHours * MODEL.farm_hourly_rate_usd);
-  const ev = round4(odds * impliedRaw * MODEL.farm_assumed_share);
-  const netPerHour = round4((ev - totalCost) / timeHours);
-  const breakEven = round4((totalCost / Math.max(1, odds * impliedRaw)) * 100);
-  const verdict: FarmEconomics['verdict'] = ev >= 5 * totalCost ? 'FARM' : ev >= totalCost ? 'MARGINAL' : 'SKIP';
-  return { gas_usd: gas, time_hours: timeHours, total_cost_usd: totalCost, expected_value_usd: ev, net_per_hour_usd: netPerHour, break_even_share_pct: breakEven, verdict };
+  const valueAtStake = round4(odds * impliedRaw);
+  // The verdict is decided on the UNROUNDED break-even share: rounding it
+  // to 4 decimals first would flip rows sitting on a cutoff (0.001% is
+  // itself a 4-decimal value). The stored figure keeps 6 decimals.
+  const breakEvenRaw = (totalCost / Math.max(1, odds * impliedRaw)) * 100;
+  const breakEven = Math.round(breakEvenRaw * 1e6) / 1e6;
+  const verdict: FarmEconomics['verdict'] =
+    breakEvenRaw <= MODEL.farm_verdict_farm_max_be_share_pct
+      ? 'FARM'
+      : breakEvenRaw <= MODEL.farm_verdict_marginal_max_be_share_pct
+        ? 'MARGINAL'
+        : 'SKIP';
+  return { gas_usd: gas, time_hours: timeHours, total_cost_usd: totalCost, value_at_stake_usd: valueAtStake, break_even_share_pct: breakEven, verdict };
 }
 
 /** The live-token protocols, by market cap, for the dashboard's comps view. */
@@ -765,6 +848,11 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
     };
   });
   scored.sort((a, b) => b.expected - a.expected || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  // Rank range: the rank a row would hold if its value landed at the low
+  // or high end of its 80% interval — 1 + the rows whose expected value
+  // is above that end.
+  const expectedDesc = scored.map((s) => s.expected);
+  const rankOf = (value: number): number => 1 + expectedDesc.filter((v) => v > value).length;
   return scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
@@ -787,6 +875,8 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
       odds_source: s.oddsSource,
       interval_low_usd: s.intervalLow,
       interval_high_usd: s.intervalHigh,
+      rank_range_low: rankOf(s.intervalLow),
+      rank_range_high: rankOf(s.intervalHigh),
       farm: s.farm,
       age_days: s.age,
     },
@@ -814,6 +904,8 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     odds_source: row.model.odds_source,
     interval_low_usd: row.model.interval_low_usd,
     interval_high_usd: row.model.interval_high_usd,
+    rank_range_low: row.model.rank_range_low,
+    rank_range_high: row.model.rank_range_high,
     farm: row.model.farm,
     on_watchlist: onWatchlist,
     farm_steps: row.farm_steps,
@@ -884,6 +976,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     interval_low_factor: round4(loFactor),
     interval_high_factor: round4(hiFactor),
     interval_loo_coverage: round4(inInterval),
+    interval_calibration: intervalCalibration(comps, snapshot.as_of),
     fallback_rows: 0,
     categories_with_enough_comps: compRows.filter((c) => c.n >= MODEL.comp_min_n).length,
     categories_total: compRows.length,
