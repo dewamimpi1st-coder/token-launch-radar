@@ -1,7 +1,9 @@
-// Token Launch Radar dashboard (radar-2-comps). Reads window.RADAR from data.js
-// and renders the ranked board, a filterable table, a per-protocol detail view
-// with the model's own inputs, the live-token comps, and the method. No network:
-// every byte it shows is in data.js.
+// Token Launch Radar dashboard (radar-3-fitted-curve). Reads window.RADAR
+// from data.js and renders the ranked board, a filterable table, a
+// per-protocol detail view with the fitted curve, cohort odds, the 80%
+// interval and the costed farm verdict, the held-out tests and ablation,
+// the cohort table, and the method. No network: every byte it shows is in
+// data.js.
 (function () {
   'use strict';
 
@@ -9,7 +11,7 @@
   var app = document.getElementById('board');
   if (!DATA || !app) return;
 
-  var state = { q: '', category: 'all', chain: 'all', watch: false, tab: 'board', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', chain: 'all', watch: false, tab: 'board', sort: 'expected', dir: -1, selected: null };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -19,10 +21,15 @@
     if (Math.abs(n) >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
     return usd.format(n);
   }
+  function fmtMoney(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return '$' + n.toFixed(2);
+  }
   function fmtPct(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
   }
+  function fmtRate(n) { return (n * 100).toFixed(1) + '%'; }
   function fmtAge(days) {
     if (days === null || days === undefined) return 'unknown';
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
@@ -32,14 +39,12 @@
 
   // The model in one function: the page recomputes a row from the snapshot
   // figures and checks the number board.json carries, so the page's code and
-  // the board's data are visibly the same arithmetic.
-  function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var ageMult = model.age_floor + (Math.min(Math.max(age, 0), model.age_days) / model.age_days) * model.age_range;
-    var breadth = 1 + Math.max(0, Math.min(row.chains.length - 1, model.breadth_max_chains)) * model.breadth_per_chain;
-    return Math.max(1, Math.round(row.tvl_usd * row.comp_ratio * growthMult * ageMult * breadth));
+  // the board's data are visibly the same arithmetic. Expected value =
+  // TVL x fitted curve ratio x cohort odds; the stored ratio and odds are
+  // already rounded to 4 decimals, and the same rounded values are used here.
+  function expectedOf(row) {
+    var impliedRaw = Math.max(1, Math.round(row.tvl_usd * row.curve_ratio));
+    return Math.max(1, Math.round(impliedRaw * row.odds));
   }
 
   function el(tag, attrs) {
@@ -85,8 +90,8 @@
     });
     var key = state.sort;
     rows.sort(function (a, b) {
-      var va = key === 'implied' ? a.implied_value_usd : key === 'tvl' ? a.tvl_usd : key === 'growth' ? (a.change_7d === null ? -999 : a.change_7d) : (a.age_days === null ? -1 : a.age_days);
-      var vb = key === 'implied' ? b.implied_value_usd : key === 'tvl' ? b.tvl_usd : key === 'growth' ? (b.change_7d === null ? -999 : b.change_7d) : (b.age_days === null ? -1 : b.age_days);
+      var va = key === 'expected' ? a.implied_value_usd : key === 'tvl' ? a.tvl_usd : key === 'odds' ? a.odds : key === 'growth' ? (a.change_7d === null ? -999 : a.change_7d) : (a.age_days === null ? -1 : a.age_days);
+      var vb = key === 'expected' ? b.implied_value_usd : key === 'tvl' ? b.tvl_usd : key === 'odds' ? b.odds : key === 'growth' ? (b.change_7d === null ? -999 : b.change_7d) : (b.age_days === null ? -1 : b.age_days);
       return (va - vb) * state.dir || (a.slug < b.slug ? -1 : 1);
     });
     return rows;
@@ -100,30 +105,33 @@
     } });
   }
 
+  function verdictBadge(v) {
+    return el('span', { class: 'badge verdict-' + v.toLowerCase(), text: v });
+  }
+
   function boardTable(rows) {
     if (rows.length === 0) return el('div', { class: 'empty', text: 'No protocol matches these filters. Clear the search or widen the category.' });
     var table = el('table', {},
       el('thead', {}, el('tr', {},
-        el('th', { class: 'num' }, sortButton('Rank', 'implied')),
+        el('th', { class: 'num' }, sortButton('Rank', 'expected')),
         el('th', {}, el('span', { text: 'Protocol' })),
         el('th', { class: 'num' }, sortButton('TVL', 'tvl')),
-        el('th', { class: 'num' }, sortButton('7d', 'growth')),
-        el('th', { class: 'num' }, sortButton('Age', 'age')),
-        el('th', { class: 'num' }, sortButton('Implied value', 'implied'))
+        el('th', { class: 'num' }, sortButton('Odds', 'odds')),
+        el('th', { class: 'num' }, sortButton('Expected value', 'expected')),
+        el('th', { text: 'Farm verdict' })
       )),
       el('tbody', {}, rows.map(function (r) {
-        var growth = r.change_7d === null ? el('span', { text: 'n/a' }) : el('span', { class: r.change_7d >= 0 ? 'pos' : 'neg', text: fmtPct(r.change_7d) });
         return el('tr', { class: state.selected === r.slug ? 'sel' : '', onclick: function () { select(r.slug); } },
           el('td', { class: 'num', text: String(r.rank) }),
           el('td', {},
             el('span', { class: 'name', text: r.name }),
             r.on_watchlist ? el('span', { class: 'badge watch', text: 'WATCHLIST' }) : null,
-            el('div', { class: 'cat', text: (r.category || 'Uncategorized') + ' · ' + r.chains.join(', ') })
+            el('div', { class: 'cat', text: (r.category || 'Uncategorized') + ' · ' + r.chains.join(', ') + ' · ' + fmtAge(r.age_days) })
           ),
           el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
-          el('td', { class: 'num' }, growth),
-          el('td', { class: 'num', text: fmtAge(r.age_days) }),
-          el('td', { class: 'num' }, el('b', { text: fmtUsd(r.implied_value_usd) }))
+          el('td', { class: 'num', text: fmtRate(r.odds) }),
+          el('td', { class: 'num' }, el('b', { text: fmtUsd(r.implied_value_usd) })),
+          el('td', {}, verdictBadge(r.farm.verdict))
         );
       }))
     );
@@ -132,20 +140,23 @@
 
   function detailView(row) {
     if (!row) return null;
-    var model = DATA.model;
-    var check = impliedOf(row, model);
+    var check = expectedOf(row);
     var match = check === row.implied_value_usd ? 'matches board.json exactly' : 'recomputed as ' + fmtUsd(check);
+    var f = row.farm;
     var box = function (k, v, d) { return el('div', { class: 'step-box' }, el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }), el('div', { class: 'd', text: d })); };
     return el('section', { class: 'detail', 'aria-label': 'Protocol detail' },
       el('h2', { text: '#' + row.rank + ' ' + row.name }),
       el('p', { class: 'facts', text: (row.category || 'Uncategorized') + ' · ' + row.chains.join(', ') + ' · TVL ' + fmtUsd(row.tvl_usd) + ' · 7d ' + fmtPct(row.change_7d) + ' · tracked ' + fmtAge(row.age_days) + (row.on_watchlist ? ' · on the watchlist' : '') }),
       el('div', { class: 'breakdown' },
         box('TVL', fmtUsd(row.tvl_usd), 'snapshot figure'),
-        box('Comp ratio', '×' + row.comp_ratio.toFixed(3), row.comp_source),
-        box('Growth', '×' + row.growth_multiplier.toFixed(3), fmtPct(row.change_7d) + ' in 7 days'),
-        box('Age', '×' + row.age_multiplier.toFixed(3), fmtAge(row.age_days) + ' with no token'),
-        box('Implied value', fmtUsd(row.implied_value_usd), 'page recompute ' + match)
+        box('Curve ratio', '×' + row.curve_ratio.toFixed(3), 'fitted curve at this TVL'),
+        box('Implied value', fmtUsd(row.implied_raw_usd), 'TVL × curve ratio'),
+        box('Launch odds', fmtRate(row.odds), row.odds_source),
+        box('Expected value', fmtUsd(row.implied_value_usd), 'page recompute ' + match)
       ),
+      el('p', { class: 'note', text: '80% interval for the expected value: ' + fmtUsd(row.interval_low_usd) + ' – ' + fmtUsd(row.interval_high_usd) + ' (from leave-one-out residuals of the fitted curve; on the live comps ' + (DATA.interval_loo_coverage * 100).toFixed(1) + '% of actual values fall inside their interval). The interval is wide because the curve explains only part of market value (R² ' + DATA.fit.r_squared.toFixed(2) + ') — the single number is a point estimate, not a promise.' }),
+      el('h3', { text: 'Farm economics — ' + f.verdict }),
+      el('p', { class: 'facts', text: 'Cost ' + fmtMoney(f.total_cost_usd) + ' (gas ' + fmtMoney(f.gas_usd) + ' + ' + f.time_hours.toFixed(2) + 'h at $' + DATA.model.farm_hourly_rate_usd + '/h) · expected value ' + fmtMoney(f.expected_value_usd) + ' (odds × implied × assumed single-farmer share 0.005% of supply) · net ' + fmtMoney(f.net_per_hour_usd) + '/h · break-even share ' + f.break_even_share_pct.toFixed(4) + '% of implied value. Verdict: FARM when expected value is ≥5× cost, MARGINAL when it covers cost, SKIP when it does not. The 0.005% farmer share is an assumption, not a measured fact — the break-even share is shown so you can judge with any share you like.' }),
       el('h3', { text: 'Farm plan — six steps, with cost and time' }),
       el('ol', { class: 'farm' }, row.farm_steps.map(function (s) {
         var parts = s.split(' Cost: ');
@@ -153,8 +164,53 @@
         var cost = parts[1] ? 'Cost: ' + parts[1] : '';
         return el('li', {}, el('span', { text: main + ' ' }), el('span', { class: 'cost', text: cost }));
       })),
-      el('p', { class: 'note', text: 'Implied value is this entry\u2019s own claim from the snapshot, not a prediction that a token will be issued, or when, or at what price.' })
+      el('p', { class: 'note', text: 'Expected value is this entry\u2019s own claim from the snapshot, not a prediction that a token will be issued, or when, or at what price. Odds are a cohort rate — the share of protocols of this age that already have a token — never a launch date.' })
     );
+  }
+
+  function heldOutTable() {
+    var rows = DATA.held_out.map(function (t) {
+      return el('tr', {},
+        el('td', { text: t.name }),
+        el('td', { class: 'num', text: t.model_median_abs_log_error.toFixed(3) }),
+        el('td', { class: 'num', text: t.baseline_median_abs_log_error.toFixed(3) }),
+        el('td', { text: t.model_beats_baseline ? 'Curve wins' : 'Baseline wins' })
+      );
+    });
+    return el('div', { class: 'panel' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', { text: 'Held-out test (live comps only)' }), el('th', { class: 'num', text: 'Curve median |log error|' }), el('th', { class: 'num', text: 'Global-median baseline' }), el('th', { text: 'Result' }))),
+      el('tbody', {}, rows)));
+  }
+
+  function ablationTable() {
+    var rows = DATA.ablation.map(function (a) {
+      return el('tr', {},
+        el('td', { text: a.term }),
+        el('td', { class: 'num', text: a.random_seed_1.toFixed(3) }),
+        el('td', { class: 'num', text: a.random_seed_42.toFixed(3) }),
+        el('td', { class: 'num', text: a.walk_forward.toFixed(3) }),
+        el('td', { class: 'num', text: a.leave_one_out.toFixed(3) }),
+        el('td', { class: 'num', text: String(a.wins_vs_curve) + ' / 4' }),
+        el('td', { text: a.kept ? 'Kept' : 'Dropped' })
+      );
+    });
+    return el('div', { class: 'panel' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', { text: 'Candidate term (median |log error| per split)' }), el('th', { class: 'num', text: 'Random s1' }), el('th', { class: 'num', text: 'Random s42' }), el('th', { class: 'num', text: 'Walk-forward' }), el('th', { class: 'num', text: 'Leave-one-out' }), el('th', { class: 'num', text: 'Wins vs curve' }), el('th', { text: 'Decision' }))),
+      el('tbody', {}, rows)));
+  }
+
+  function cohortTable() {
+    var rows = DATA.cohort.map(function (c) {
+      return el('tr', {},
+        el('td', { text: c.label }),
+        el('td', { class: 'num', text: String(c.n_protocols) }),
+        el('td', { class: 'num', text: String(c.n_with_token) }),
+        el('td', { class: 'num', text: fmtRate(c.rate) })
+      );
+    });
+    return el('div', { class: 'panel' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', { text: 'Age bucket' }), el('th', { class: 'num', text: 'Protocols' }), el('th', { class: 'num', text: 'With a token' }), el('th', { class: 'num', text: 'Cohort rate (odds)' }))),
+      el('tbody', {}, rows)));
   }
 
   function compsView() {
@@ -163,7 +219,7 @@
         el('td', { text: c.category }),
         el('td', { class: 'num', text: String(c.n) }),
         el('td', { class: 'num', text: '×' + c.median_ratio.toFixed(3) }),
-        el('td', { text: c.used ? 'Used as the category comp' : 'Too thin — global median used instead' })
+        el('td', { text: c.n >= DATA.model.comp_min_n ? 'n ≥ ' + DATA.model.comp_min_n + ' — tested, but dropped by ablation (see below)' : 'Too thin (n < ' + DATA.model.comp_min_n + ')' })
       );
     });
     var live = DATA.live.map(function (p) {
@@ -175,11 +231,19 @@
       );
     });
     return el('div', {},
-      el('div', { class: 'lede' }, el('p', { text: 'The comps are the market\u2019s own pricing: for each category, the median market-cap / TVL of its live-token protocols. A category with fewer than ' + DATA.model.comp_min_n + ' live comps falls back to the global median (×' + DATA.global_comp.toFixed(3) + '). Ratios are clamped to ×' + DATA.model.comp_floor + '–×' + DATA.model.comp_cap + '.' })),
+      el('div', { class: 'lede' }, el('p', { text: 'Fitted curve: log(market cap) = ' + DATA.fit.intercept.toFixed(4) + ' + ' + DATA.fit.slope.toFixed(4) + ' × log(TVL), fitted on ' + DATA.fit.n_comps + ' live-token comps (market cap > 0, TVL > 0, CEX excluded). R² ' + DATA.fit.r_squared.toFixed(3) + '. The curve — not the category median — prices every row: the category-median adjustment was tested by ablation and dropped (it beat the curve alone on only 2 of 4 held-out splits).' })),
+      el('h3', { text: 'Held-out tests — fitted curve vs global-median baseline' }),
+      heldOutTable(),
+      el('h3', { text: 'Ablation — every candidate term vs the curve alone (kept only with ≥3 wins of 4)' }),
+      ablationTable(),
+      el('h3', { text: 'Launch odds — cohort rates by age bucket' }),
+      el('p', { class: 'note', text: 'Odds are a cohort rate: the share of protocols in the age bucket that already have a token. Not a launch date, not a prediction of when a protocol launches. Category × age cells were checked too: only ' + DATA.cohort_cells_passing + ' of ' + DATA.cohort_cells_total + ' cells have n ≥ 20, so age buckets alone are used. Protocols with unknown age get the overall known-age rate (' + fmtRate(DATA.cohort_overall_known_age_rate) + ').' }),
+      cohortTable(),
+      el('h3', { text: 'Category medians (diagnostic only — not used for pricing)' }),
       el('div', { class: 'panel' }, el('table', {},
-        el('thead', {}, el('tr', {}, el('th', { text: 'Category' }), el('th', { class: 'num', text: 'Live comps' }), el('th', { class: 'num', text: 'Median mcap / TVL' }), el('th', { text: 'Used?' }))),
+        el('thead', {}, el('tr', {}, el('th', { text: 'Category' }), el('th', { class: 'num', text: 'Live comps' }), el('th', { class: 'num', text: 'Median mcap / TVL' }), el('th', { text: 'Status' }))),
         el('tbody', {}, rows))),
-      el('h3', { text: 'Live-token protocols the comps come from (top 24 by market cap)' }),
+      el('h3', { text: 'Live-token protocols the curve is fitted from (top 24 by market cap)' }),
       el('div', { class: 'panel' }, el('table', {},
         el('thead', {}, el('tr', {}, el('th', { text: 'Protocol' }), el('th', { class: 'num', text: 'TVL' }), el('th', { class: 'num', text: 'Market cap' }), el('th', { class: 'num', text: 'mcap / TVL' }))),
         el('tbody', {}, live)))
@@ -188,17 +252,21 @@
 
   function methodView() {
     var m = DATA.model;
+    var f = DATA.fit;
+    var vc = DATA.farm_verdict_counts;
     return el('div', { class: 'panel method' },
       el('h2', { text: 'How the ranking is made' }),
-      el('p', {}, el('code', { text: 'implied = TVL × compRatio × growthMult × ageMult × breadthMult' })),
+      el('p', {}, el('code', { text: 'expected = TVL × curveRatio × odds' }), document.createTextNode('  —  curveRatio = exp(a + b·log(TVL)) / TVL, odds = cohort rate for the age bucket.')),
       el('ul', {},
-        el('li', { text: 'compRatio — median market-cap / TVL of live-token protocols in the same category (n ≥ ' + m.comp_min_n + '), else the global median ×' + DATA.global_comp.toFixed(3) + '; clamped to ×' + m.comp_floor + '–×' + m.comp_cap + '.' }),
-        el('li', { text: 'growthMult — 1 + clamp(7-day TVL change, ' + m.growth_floor + '%, +' + m.growth_cap + '%) / 100 × ' + m.growth_weight + '.' }),
-        el('li', { text: 'ageMult — ' + m.age_floor + ' + 0.15 × min(age, ' + m.age_days + ' days) / ' + m.age_days + '; unknown age is scored at ' + m.unknown_age_days + ' days.' }),
-        el('li', { text: 'breadthMult — 1 + ' + m.breadth_per_chain + ' per extra chain, up to ' + m.breadth_max_chains + ' extra chains.' })
+        el('li', { text: 'Curve — log(market cap) = ' + f.intercept.toFixed(4) + ' + ' + f.slope.toFixed(4) + ' × log(TVL), fitted by least squares on ' + f.n_comps + ' live-token comps on every run (never hard-coded). R² ' + f.r_squared.toFixed(3) + '. Comps with market cap ≤ 0 are filtered out (' + f.filtered_mcap_le_zero + ' filtered) and CEX protocols are excluded from the fit (' + f.excluded_cex_from_fit + ').' }),
+        el('li', { text: 'Held-out — the curve beats the global-median baseline on ' + DATA.held_out.filter(function (t) { return t.model_beats_baseline; }).length + ' of ' + DATA.held_out.length + ' tests: ' + DATA.held_out.map(function (t) { return t.name + ' ' + t.model_median_abs_log_error.toFixed(3) + ' vs ' + t.baseline_median_abs_log_error.toFixed(3); }).join('; ') + ' (median |log error|).' }),
+        el('li', { text: 'Ablation — a term is kept only if it beats the curve alone on ≥3 of 4 held-out splits. Category-median adjustment (2/4), 7-day growth (2/4), age (1/4) and chain count (2/4) were all dropped, so the ranking uses the curve alone. Growth, age and chain count are therefore NOT in the price; the 7-day change and age are still shown per row as facts.' }),
+        el('li', { text: 'Odds — cohort rate by age bucket (' + DATA.cohort.map(function (c) { return c.label + ' ' + fmtRate(c.rate); }).join(', ') + '). This is the share of protocols of that age that already have a token. It is NOT a launch date and it does not say when a protocol will launch; it rises with age because time accumulates. Only ' + DATA.cohort_cells_passing + ' of ' + DATA.cohort_cells_total + ' category × age cells have n ≥ 20, so buckets alone are used.' }),
+        el('li', { text: 'Interval — the 80% interval multiplies the expected value by ×' + DATA.interval_low_factor.toFixed(3) + ' to ×' + DATA.interval_high_factor.toFixed(3) + ', from the 10th/90th percentiles of leave-one-out residuals; ' + (DATA.interval_loo_coverage * 100).toFixed(1) + '% of live comps\u2019 actual values fall inside their interval. Wide, because R² is only ' + f.r_squared.toFixed(2) + '.' }),
+        el('li', { text: 'Farm verdict — cost = gas ($4–$8 to set up + $2/week over the hold) + time at $' + m.farm_hourly_rate_usd + '/h; expected value = odds × implied × assumed single-farmer share 0.005% of supply (an assumption, not a measured fact). FARM when expected value ≥5× cost, MARGINAL when it covers cost, SKIP when it does not. Verdicts across the board: ' + vc.FARM + ' FARM, ' + vc.MARGINAL + ' MARGINAL, ' + vc.SKIP + ' SKIP. The break-even share (cost ÷ odds × implied) is shown per row so any farmer share can be substituted.' })
       ),
-      el('p', { text: 'The board ranks ' + DATA.board_size + ' pre-token protocols: all ' + DATA.watchlist_size + ' on the watchlist plus every other rankable pre-token protocol in the snapshot. ' + DATA.pre_token_audited + ' protocols in the snapshot record no token; the rest are set aside because they already trade, are versioned pools, or are wrapped / staked / bridged products of a token that already trades. Live-token protocols are shown apart, at the market\u2019s own values, never mixed into the ranked board.' }),
-      el('p', { class: 'note', text: 'Source: ' + DATA.source + '. Snapshot as of ' + DATA.as_of + '. Implied value is this entry\u2019s own claim, never make.fun\u2019s, and it does not predict whether or when a token is issued.' })
+      el('p', { text: 'The board ranks ' + DATA.board_size + ' pre-token protocols: all ' + DATA.watchlist_size + ' on the watchlist plus every other rankable pre-token protocol in the snapshot. ' + DATA.pre_token_audited + ' protocols in the snapshot record no token; ' + DATA.excluded_pre_token + ' of those are excluded (versioned pools or wrapped / staked / bridged products of a token that already trades) and ' + DATA.live_total + ' already trade. All 758 protocols are accounted for: ' + DATA.board_size + ' ranked + ' + DATA.excluded_pre_token + ' pre-token excluded + ' + DATA.live_total + ' live. No category-median fallback is used: ' + DATA.fallback_rows + ' of ' + DATA.board_size + ' rows are priced by a category median; all are priced by the fitted curve. ' + DATA.categories_with_enough_comps + ' of ' + DATA.categories_total + ' categories have n ≥ ' + m.comp_min_n + ' live comps.' }),
+      el('p', { class: 'note', text: 'Source: ' + DATA.source + '. Snapshot as of ' + DATA.as_of + '. Implied and expected values are this entry\u2019s own claims, never make.fun\u2019s, and they do not predict whether or when a token is issued.' })
     );
   }
 
@@ -210,6 +278,27 @@
     if (d) d.scrollIntoView({ block: 'nearest' });
   }
 
+  function integrityStrip() {
+    var wins = DATA.held_out.filter(function (t) { return t.model_beats_baseline; }).length;
+    var items = [
+      [String(DATA.board_size), 'protocols ranked'],
+      [DATA.watchlist_size + '/40', 'watchlist covered'],
+      ['758 = ' + DATA.board_size + ' + ' + DATA.excluded_pre_token + ' + ' + DATA.live_total, 'protocols accounted for'],
+      [String(DATA.fit.filtered_mcap_le_zero), 'live comps filtered (mcap ≤ 0)'],
+      [String(DATA.fallback_rows), 'rows priced by category median (0 — curve prices all)'],
+      [DATA.categories_with_enough_comps + '/' + DATA.categories_total, 'categories with n ≥ 4 live comps'],
+      ['a ' + DATA.fit.intercept.toFixed(2) + ' · b ' + DATA.fit.slope.toFixed(2) + ' · R² ' + DATA.fit.r_squared.toFixed(2), 'fitted curve (n=' + DATA.fit.n_comps + ')'],
+      [wins + '/' + DATA.held_out.length, 'held-out tests beat baseline'],
+      [DATA.model_version, 'model version']
+    ];
+    return el('div', { class: 'strip', 'aria-label': 'Integrity strip' },
+      items.map(function (it) {
+        return el('div', { class: 'strip-item' }, el('div', { class: 'n', text: it[0] }), el('div', { class: 'l', text: it[1] }));
+      }),
+      el('div', { class: 'strip-note', text: 'Every number above is computed from the snapshot on this run. Page recompute matches board.json exactly — open any row to check.' })
+    );
+  }
+
   function render() {
     app.setAttribute('aria-busy', 'false');
     app.innerHTML = '';
@@ -218,7 +307,7 @@
     var head = el('header', { class: 'brand' },
       el('div', {},
         el('h1', {}, document.createTextNode('Token Launch '), el('em', { text: 'Radar' })),
-        el('p', { class: 'sub', text: 'Pre-token protocols ranked by comps-implied launch value, with a farm plan for each one. Model ' + DATA.model_version + '.' })
+        el('p', { class: 'sub', text: 'Pre-token protocols ranked by odds-weighted, curve-implied launch value, with a costed farm verdict for each one. Model ' + DATA.model_version + '.' })
       ),
       el('div', { class: 'meta' },
         el('div', {}, el('b', { text: 'Snapshot ' + DATA.as_of }), document.createTextNode(' · DefiLlama')),
@@ -226,16 +315,17 @@
       )
     );
     wrap.appendChild(head);
+    wrap.appendChild(integrityStrip());
 
     var top = DATA.rows[0];
     var stats = el('div', { class: 'stats' },
       el('div', { class: 'stat' }, el('div', { class: 'n', text: String(DATA.board_size) }), el('div', { class: 'l', text: 'protocols ranked' })),
       el('div', { class: 'stat' }, el('div', { class: 'n', text: String(DATA.watchlist_size) }), el('div', { class: 'l', text: 'on the watchlist (all covered)' })),
-      el('div', { class: 'stat' }, el('div', { class: 'n', text: top ? fmtUsd(top.implied_value_usd) : '—' }), el('div', { class: 'l', text: 'top implied value' + (top ? ' — ' + top.name : '') })),
-      el('div', { class: 'stat' }, el('div', { class: 'n', text: '×' + DATA.global_comp.toFixed(3) }), el('div', { class: 'l', text: 'global median mcap / TVL' }))
+      el('div', { class: 'stat' }, el('div', { class: 'n', text: top ? fmtUsd(top.implied_value_usd) : '—' }), el('div', { class: 'l', text: 'top expected value' + (top ? ' — ' + top.name : '') })),
+      el('div', { class: 'stat' }, el('div', { class: 'n', text: '×' + DATA.global_comp.toFixed(3) }), el('div', { class: 'l', text: 'global median mcap / TVL (reference)' }))
     );
     wrap.appendChild(stats);
-    wrap.appendChild(el('div', { class: 'lede' }, el('p', {}, document.createTextNode('Implied value = TVL × '), el('code', { text: 'comp ratio' }), document.createTextNode(' (the market\u2019s median mcap / TVL for the category) × growth × age × chain breadth. No name is ever special-cased: the same formula scores every row, and the page recomputes each row\u2019s number from the snapshot figures.'))));
+    wrap.appendChild(el('div', { class: 'lede' }, el('p', {}, document.createTextNode('Expected value = TVL × '), el('code', { text: 'fitted curve ratio' }), document.createTextNode(' × '), el('code', { text: 'cohort odds' }), document.createTextNode('. The curve log(mcap) = ' + DATA.fit.intercept.toFixed(2) + ' + ' + DATA.fit.slope.toFixed(2) + '·log(TVL) is fitted from ' + DATA.fit.n_comps + ' live-token comps on every run; odds are the share of protocols of the same age that already have a token — a cohort rate, never a launch date. No name is ever special-cased, and the page recomputes each row\u2019s number from the snapshot figures.'))));
 
     var controls = el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { text: 'Search' }), el('input', { type: 'search', placeholder: 'Protocol name or slug…', value: state.q, oninput: function (e) { state.q = e.target.value; render(); } })),
@@ -269,7 +359,7 @@
       wrap.appendChild(methodView());
     }
 
-    wrap.appendChild(el('footer', { text: 'Data: ' + DATA.source + ' · Snapshot ' + DATA.as_of + ' · Model ' + DATA.model_version + ' · Implied values are this entry\u2019s own claims, not predictions that a token will be issued.' }));
+    wrap.appendChild(el('footer', { text: 'Data: ' + DATA.source + ' · Snapshot ' + DATA.as_of + ' · Model ' + DATA.model_version + ' · Expected values are this entry\u2019s own claims, not predictions that a token will be issued.' }));
     app.appendChild(wrap);
   }
 

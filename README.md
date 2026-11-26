@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/dewamimpi1st-coder/token-launch-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/dewamimpi1st-coder/token-launch-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-Token Launch Radar ranks pre-token DeFi protocols by a comps-implied launch value — each category priced at the market's own median market-cap / TVL — and gives every protocol a concrete six-step farm plan with cost and time.
+Token Launch Radar (radar-3) ranks pre-token DeFi protocols by an odds-weighted, curve-implied launch value: a log-log curve `log(mcap) = a + b·log(TVL)` fitted by least squares on the snapshot's own live-token comps on every run (a ≈ 7.79, b ≈ 0.47, R² ≈ 0.14 on the current snapshot — the coefficients are recomputed each run, never hard-coded), times the cohort launch odds for the protocol's age bucket. Every candidate term (category median, 7-day growth, age, chain count) was tested by ablation on four held-out splits and dropped, because none beat the curve alone on ≥3 of 4 splits; the dashboard shows the held-out tests, the ablation table, an integrity strip, an 80% interval per row, and a costed farm verdict (FARM / MARGINAL / SKIP) for every protocol, with a concrete six-step farm plan with cost and time.
 
 ## Run it
 
